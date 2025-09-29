@@ -1,5 +1,5 @@
 streamlit==1.38.0
-pandas>=2.2
-numpy>=1.26
-pydeck>=0.9.1
-pyarrow>=16.0.0
+pandas==2.2.2
+numpy==1.26.4
+pydeck==0.9.1
+pyarrow==16.1.0
