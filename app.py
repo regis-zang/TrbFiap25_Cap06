@@ -1,5 +1,5 @@
 # app.py
-import sys
+import sys, json
 from pathlib import Path
 
 import numpy as np
@@ -7,19 +7,20 @@ import pandas as pd
 import streamlit as st
 import pydeck as pdk
 
-# ======= OBRIGATÓRIO SER PRIMEIRA CHAMADA =======
+# ======= PRIMEIRA CHAMADA DO STREAMLIT =======
 st.set_page_config(page_title="Mapa de Clusters • CDs", layout="wide")
-# ================================================
+# =============================================
 
 # (diagnóstico opcional)
 st.caption(f"Python: {sys.version.split()[0]}")
 
-# --------------- Config ---------------
+# ---------------- Config ----------------
 DATA_DIR = Path("DataBase")
 POINTS_FILE = DATA_DIR / "points_enriched_final.parquet"
 CLUSTERS_FILE = DATA_DIR / "clusters_summary_final.parquet"
+UF_GEOJSON = DATA_DIR / "br_estados.geojson"     # opcional (limites de UF)
 
-# --------------- Utils ---------------
+# ---------------- Utils ----------------
 @st.cache_data(show_spinner=False)
 def load_parquet_safe(path: Path) -> pd.DataFrame:
     if not path.exists():
@@ -28,8 +29,9 @@ def load_parquet_safe(path: Path) -> pd.DataFrame:
             f"Arquivo não encontrado: {path}\n"
             f"Disponíveis em {DATA_DIR.resolve()}:\n - " + "\n - ".join(existing)
         )
+    # fastparquet por default
     try:
-        return pd.read_parquet(path)                 # fastparquet por default
+        return pd.read_parquet(path)
     except Exception:
         return pd.read_parquet(path, engine="fastparquet")
 
@@ -66,7 +68,7 @@ def compute_view_safe(lons, lats):
         from pydeck.data_utils import compute_view
         df = pd.DataFrame({"lon": lons, "lat": lats})
         if df.empty:
-            return pdk.ViewState(latitude=0, longitude=0, zoom=2)
+            return pdk.ViewState(latitude=-14.2, longitude=-51.9, zoom=3.5)
         view = compute_view(df[["lon", "lat"]])
         try:
             view.zoom = min(9, max(3, float(view.zoom) + 0.8))
@@ -75,18 +77,20 @@ def compute_view_safe(lons, lats):
         return view
     except Exception:
         if len(lats) == 0:
-            return pdk.ViewState(latitude=0, longitude=0, zoom=2)
+            return pdk.ViewState(latitude=-14.2, longitude=-51.9, zoom=3.5)
         return pdk.ViewState(latitude=float(np.mean(lats)),
                              longitude=float(np.mean(lons)),
                              zoom=6)
 
 def build_deck_resilient(layers, view_state, tooltip_cfg):
     deck_kwargs = dict(initial_view_state=view_state, layers=layers)
+    # tooltip (algumas versões não aceitam; tratamos abaixo)
     try:
         deck_kwargs["tooltip"] = tooltip_cfg
     except Exception:
         pass
 
+    # Mapbox opcional
     mapbox_key = st.secrets.get("MAPBOX_API_KEY", "").strip()
     if mapbox_key:
         try:
@@ -103,10 +107,32 @@ def build_deck_resilient(layers, view_state, tooltip_cfg):
             deck_kwargs.pop("tooltip", None)
             return pdk.Deck(**deck_kwargs)
 
-# --------------- Load ---------------
+# ------------- GeoPandas (opcional) -------------
+try:
+    import geopandas as gpd
+    GEOPANDAS_OK = True
+except Exception:
+    GEOPANDAS_OK = False
+
+def load_uf_geojson_df(path: Path):
+    """Carrega GeoJSON sem Fiona (via json) e monta um GeoDataFrame."""
+    with open(path, "r", encoding="utf-8") as f:
+        gj = json.load(f)
+    gdf = gpd.GeoDataFrame.from_features(gj["features"], crs="EPSG:4326")
+    # tenta identificar coluna de UF
+    for cand in ["sigla", "UF", "uf", "sigla_uf", "SIGLA_UF", "name", "NM_UF", "NOME_UF"]:
+        if cand in gdf.columns:
+            gdf["uf_col"] = gdf[cand].astype(str)
+            break
+    else:
+        gdf["uf_col"] = gdf.iloc[:, 0].astype(str)  # fallback
+    return gdf
+
+# ---------------- Load ----------------
 points = load_parquet_safe(POINTS_FILE)
 clusters = load_parquet_safe(CLUSTERS_FILE)
-points.columns = [c.strip().lower() for c in points.columns]
+
+points.columns  = [c.strip().lower() for c in points.columns]
 clusters.columns = [c.strip().lower() for c in clusters.columns]
 
 req_points = {'cluster','latitude','longitude'}
@@ -118,15 +144,14 @@ if missing_p:
 if missing_c:
     st.error(f"Faltam colunas em clusters: {missing_c}"); st.stop()
 
-# Se não veio radius_km, calcula agora
+# radius_km (p90) se não existir
 if 'radius_km' not in clusters.columns:
     tmp = points.merge(clusters[['cluster','centroid_lat','centroid_lon']],
                        on='cluster', how='left', validate='m:1')
     tmp['dist_km'] = haversine_km(tmp['latitude'], tmp['longitude'],
                                   tmp['centroid_lat'], tmp['centroid_lon'])
     clusters = clusters.merge(
-        tmp.groupby('cluster')['dist_km'].quantile(0.9)
-           .rename('radius_km').reset_index(),
+        tmp.groupby('cluster')['dist_km'].quantile(0.9).rename('radius_km').reset_index(),
         on='cluster', how='left'
     )
 
@@ -137,86 +162,138 @@ if 'cd_name' not in clusters.columns:
 
 clusters['radius_m'] = (clusters['radius_km'].fillna(0)*1000).astype(float)
 
-# --------------- Sidebar / filtros ---------------
+# metadados úteis no points
+points = points.merge(clusters[['cluster','cd_name','region_macro']],
+                      on='cluster', how='left')
+
+# ---------------- Sidebar / filtros ----------------
 st.sidebar.header("Filtros")
 cluster_opts = sorted(clusters['cluster'].astype(int).unique().tolist())
 sel_clusters = st.sidebar.multiselect("Clusters", cluster_opts, default=cluster_opts)
+
 region_opts = sorted(clusters['region_macro'].dropna().unique().tolist())
 sel_regions = st.sidebar.multiselect("Macro-região", region_opts, default=region_opts)
+
 max_points = int(st.sidebar.number_input("Máx. de pontos no mapa (amostra)",
                                          min_value=500, max_value=50000, value=7000, step=500))
 show_points    = st.sidebar.checkbox("Mostrar pontos", value=True)
 show_areas     = st.sidebar.checkbox("Mostrar áreas (raio p90)", value=True)
 show_centroids = st.sidebar.checkbox("Mostrar centróides", value=True)
 color_points_by_region = st.sidebar.checkbox("Colorir pontos por macro-região", value=False)
+show_heatmap  = st.sidebar.checkbox("Mostrar heatmap", value=False)
+show_uf_layer = st.sidebar.checkbox("Mostrar limites de UF (GeoJSON)", value=False if not UF_GEOJSON.exists() else True)
+agg_by_uf     = st.sidebar.checkbox("Agregação por UF (GeoPandas)", value=False) if GEOPANDAS_OK and UF_GEOJSON.exists() else False
 
-# --------------- Filtragem + limpeza ---------------
+# ---------------- Filtragem + limpeza ----------------
 points_f = points[points['cluster'].astype(int).isin(sel_clusters)].copy()
 clusters_f = clusters[clusters['cluster'].astype(int).isin(sel_clusters)].copy()
 if sel_regions:
     clusters_f = clusters_f[clusters_f['region_macro'].isin(sel_regions)]
     points_f   = points_f[points_f['cluster'].isin(clusters_f['cluster'])]
 
-# LIMPEZA GEOGRÁFICA (chave para as camadas aparecerem)
-points_f   = clean_geo(points_f,   "longitude",     "latitude")
-clusters_f = clean_geo(clusters_f, "centroid_lon",  "centroid_lat")
+# limpeza (fundamental)
+points_f   = clean_geo(points_f,   "longitude",    "latitude")
+clusters_f = clean_geo(clusters_f, "centroid_lon", "centroid_lat")
 
-# --------------- KPIs ---------------
+# ---------------- KPIs ----------------
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Clusters", int(clusters_f['cluster'].nunique()))
 c2.metric("Pontos",   int(points_f.shape[0]))
 c3.metric("Raio p90 médio (km)", f"{clusters_f['radius_km'].mean():.2f}")
 c4.metric("Maior raio p90 (km)", f"{clusters_f['radius_km'].max():.2f}")
 
-# --------------- Mapa ---------------
+# ---------------- Mapa ----------------
 st.subheader("Mapa de Clusters e Áreas de Cobertura (p90)")
 
 layers = []
+
 if not clusters_f.empty:
     # auto-zoom DEPOIS da limpeza
     lons = pd.concat([points_f['longitude'], clusters_f['centroid_lon']], ignore_index=True)
-    lats = pd.concat([points_f['latitude'],  clusters_f['centroid_lat']], ignore_index=True)
+    lats = pd.concat([points_f['latitude'],  clusters_f['centroid_lat']],  ignore_index=True)
     view = compute_view_safe(lons, lats)
 
-    # pontos
+    # 1) UF boundaries (GeoJSON)
+    if show_uf_layer and UF_GEOJSON.exists():
+        try:
+            with open(UF_GEOJSON, "r", encoding="utf-8") as f:
+                gj_data = json.load(f)  # dict GeoJSON
+            layers.append(pdk.Layer(
+                "GeoJsonLayer",
+                data=gj_data,
+                stroked=True,
+                filled=False,
+                get_line_color=[80, 80, 80, 180],
+                line_width_min_pixels=1
+            ))
+        except Exception as e:
+            st.warning(f"Falha ao ler GeoJSON: {e}")
+
+    # 2) Heatmap (opcional)
+    if show_heatmap and not points_f.empty:
+        layers.append(pdk.Layer(
+            "HeatmapLayer",
+            data=points_f,
+            get_position='[longitude, latitude]',
+            aggregation='"SUM"',
+            get_weight=1,
+            radiusPixels=30
+        ))
+
+    # 3) pontos (em pixels — visíveis em qualquer zoom)
     if show_points and not points_f.empty:
         pts = points_f if len(points_f) <= max_points else points_f.sample(max_points, random_state=42)
         if color_points_by_region:
-            pts = pts.copy(); pts['rgb'] = pts['region_macro'].apply(color_by_region)
-            layers.append(pdk.Layer(
-                "ScatterplotLayer", data=pts,
-                get_position='[longitude, latitude]',
-                get_radius=160, radius_units="meters", filled=True,
-                pickable=True, get_fill_color='rgb'
-            ))
+            pts = pts.copy()
+            pts['rgb'] = pts['region_macro'].apply(color_by_region)
+            point_color = 'rgb'
         else:
-            layers.append(pdk.Layer(
-                "ScatterplotLayer", data=pts,
-                get_position='[longitude, latitude]',
-                get_radius=160, radius_units="meters", filled=True,
-                pickable=True, get_fill_color=[30,144,255,160]
-            ))
+            point_color = [30, 144, 255, 200]  # dodgerblue
 
-    # áreas p90
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=pts,
+            get_position='[longitude, latitude]',
+            get_fill_color=point_color,
+            get_radius=6,                 # pixels
+            radius_units="pixels",
+            pickable=True,
+            stroked=True,
+            get_line_color=[0, 0, 0, 120],
+            line_width_min_pixels=1
+        ))
+
+    # 4) áreas p90 (em metros — grandes)
     if show_areas and not clusters_f.empty:
         areas = clusters_f.assign(radius_m=clusters_f['radius_m'].clip(lower=200)).copy()
         areas['rgb'] = areas['region_macro'].apply(color_by_region)
         layers.append(pdk.Layer(
-            "ScatterplotLayer", data=areas,
+            "ScatterplotLayer",
+            data=areas,
             get_position='[centroid_lon, centroid_lat]',
-            get_radius="radius_m", radius_units="meters", filled=True,
-            pickable=True, get_fill_color='rgb',
-            get_line_color=[50,50,50,220], line_width_min_pixels=1
+            get_radius="radius_m",          # metros
+            radius_units="meters",
+            radius_min_pixels=3,            # visível mesmo longe
+            pickable=True,
+            filled=True,
+            get_fill_color='rgb',
+            stroked=True,
+            get_line_color=[50, 50, 50, 220],
+            line_width_min_pixels=1
         ))
 
-    # centróides
+    # 5) centróides (marcador em pixels/metros pequenos)
     if show_centroids and not clusters_f.empty:
-        centers = clusters_f.copy(); centers['rgb'] = centers['region_macro'].apply(color_by_region)
+        centers = clusters_f.copy()
+        centers['rgb'] = centers['region_macro'].apply(color_by_region)
         layers.append(pdk.Layer(
-            "ScatterplotLayer", data=centers,
+            "ScatterplotLayer",
+            data=centers,
             get_position='[centroid_lon, centroid_lat]',
-            get_radius=110, radius_units="meters", filled=True,
-            get_fill_color='rgb', pickable=True
+            get_radius=110,
+            radius_units="meters",
+            get_fill_color='rgb',
+            pickable=True
         ))
 
     tooltip_cfg = {
@@ -237,7 +314,29 @@ if not clusters_f.empty:
 else:
     st.warning("Nenhum cluster selecionado para exibir no mapa.")
 
-# --------------- Tabela + download ---------------
+# ---------------- GeoPandas: agregação por UF ----------------
+if agg_by_uf and GEOPANDAS_OK and UF_GEOJSON.exists():
+    try:
+        gdf_uf = load_uf_geojson_df(UF_GEOJSON)
+        # cria GeoDataFrames sem Fiona
+        gdf_pts = gpd.GeoDataFrame(
+            points_f,
+            geometry=gpd.points_from_xy(points_f["longitude"], points_f["latitude"]),
+            crs="EPSG:4326"
+        )
+        # sjoin pontos->UF
+        joined = gpd.sjoin(gdf_pts, gdf_uf[["uf_col", "geometry"]], how="left", predicate="within")
+        resumo_uf = (joined.drop(columns="geometry")
+                           .groupby("uf_col")
+                           .size()
+                           .reset_index(name="num_pontos")
+                           .sort_values("num_pontos", ascending=False))
+        st.markdown("### Pontos por UF (GeoPandas)")
+        st.dataframe(resumo_uf, use_container_width=True)
+    except Exception as e:
+        st.warning(f"GeoPandas não pôde agregar por UF: {e}")
+
+# ---------------- Tabela + download ----------------
 st.markdown("### Clusters selecionados")
 st.dataframe(
     clusters_f[['cluster','cd_name','region_macro','radius_km','n_points']].sort_values('cluster'),
