@@ -7,7 +7,11 @@ import pandas as pd
 import streamlit as st
 import pydeck as pdk
 
-# ---- (opcional) diagnose de versões
+# ========= PRIMEIRA CHAMADA DO STREAMLIT =========
+st.set_page_config(page_title="Mapa de Clusters • CDs", layout="wide")
+# =================================================
+
+# (opcional) diagnose de versões
 st.caption(f"Python: {sys.version.split()[0]}")
 try:
     import numpy as _np, pandas as _pd, fastparquet as _fp  # noqa: F401
@@ -18,7 +22,6 @@ except Exception:
 # =========================
 # Config
 # =========================
-st.set_page_config(page_title="Mapa de Clusters • CDs", layout="wide")
 DATA_DIR = Path("DataBase")
 POINTS_FILE = DATA_DIR / "points_enriched_final.parquet"
 CLUSTERS_FILE = DATA_DIR / "clusters_summary_final.parquet"
@@ -34,11 +37,9 @@ def load_parquet_safe(path: Path) -> pd.DataFrame:
             f"Arquivo não encontrado: {path}\n"
             f"Disponíveis em {DATA_DIR.resolve()}:\n - " + "\n - ".join(existing)
         )
-    # tenta engine default (deve pegar fastparquet)
     try:
-        return pd.read_parquet(path)
+        return pd.read_parquet(path)                 # deve usar fastparquet
     except Exception:
-        # força fastparquet explicitamente
         return pd.read_parquet(path, engine="fastparquet")
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -61,7 +62,6 @@ def color_by_region(region: str) -> list:
     return pal.get(region, pal["Indefinido"])
 
 def compute_view_safe(lons, lats):
-    """Tenta usar compute_view do pydeck; se não existir, faz um fallback simples."""
     try:
         from pydeck.data_utils import compute_view
         df = pd.DataFrame({"lon": lons, "lat": lats})
@@ -77,15 +77,12 @@ def compute_view_safe(lons, lats):
                              zoom=6)
 
 def build_deck_resilient(layers, view_state, tooltip_cfg):
-    """Cria o pdk.Deck com Mapbox (se houver token), senão Carto, senão sem base map."""
     deck_kwargs = dict(initial_view_state=view_state, layers=layers)
-    # tenta incluir tooltip; se a versão não suportar, remove
     try:
         deck_kwargs["tooltip"] = tooltip_cfg
     except Exception:
         pass
 
-    # token via secrets (se houver)
     mapbox_key = st.secrets.get("MAPBOX_API_KEY", "").strip()
     if mapbox_key:
         try:
@@ -108,11 +105,9 @@ def build_deck_resilient(layers, view_state, tooltip_cfg):
 points = load_parquet_safe(POINTS_FILE)
 clusters = load_parquet_safe(CLUSTERS_FILE)
 
-# normaliza nomes
 points.columns = [c.strip().lower() for c in points.columns]
 clusters.columns = [c.strip().lower() for c in clusters.columns]
 
-# sanity
 req_points = {'cluster','latitude','longitude'}
 req_clusters = {'cluster','centroid_lat','centroid_lon','n_points'}
 missing_p = req_points - set(points.columns)
@@ -124,7 +119,6 @@ if missing_c:
     st.error(f"Faltam colunas em clusters: {missing_c}")
     st.stop()
 
-# radius_km (p90) se não existir
 if 'radius_km' not in clusters.columns:
     tmp = points.merge(
         clusters[['cluster','centroid_lat','centroid_lon']],
@@ -137,7 +131,6 @@ if 'radius_km' not in clusters.columns:
         on='cluster', how='left'
     )
 
-# region_macro & cd_name
 if 'region_macro' not in clusters.columns:
     clusters['region_macro'] = 'Indefinido'
 if 'cd_name' not in clusters.columns:
@@ -145,7 +138,6 @@ if 'cd_name' not in clusters.columns:
 
 clusters['radius_m'] = (clusters['radius_km'].fillna(0)*1000).astype(float)
 
-# metadata para points
 points = points.merge(clusters[['cluster','cd_name','region_macro']],
                       on='cluster', how='left')
 
@@ -153,10 +145,8 @@ points = points.merge(clusters[['cluster','cd_name','region_macro']],
 # Sidebar / filtros
 # =========================
 st.sidebar.header("Filtros")
-
 cluster_opts = sorted(clusters['cluster'].astype(int).unique().tolist())
 sel_clusters = st.sidebar.multiselect("Clusters", cluster_opts, default=cluster_opts)
-
 region_opts = sorted(clusters['region_macro'].dropna().unique().tolist())
 sel_regions = st.sidebar.multiselect("Macro-região", region_opts, default=region_opts)
 
@@ -192,89 +182,39 @@ st.subheader("Mapa de Clusters e Áreas de Cobertura (p90)")
 
 layers = []
 if not clusters_f.empty:
-    # -------- view automático
-    lons = pd.concat(
-        [
-            points_f['longitude'],
-            clusters_f['centroid_lon']
-        ],
-        ignore_index=True
-    )
-    lats = pd.concat(
-        [
-            points_f['latitude'],
-            clusters_f['centroid_lat']
-        ],
-        ignore_index=True
-    )
+    lons = pd.concat([points_f['longitude'], clusters_f['centroid_lon']], ignore_index=True)
+    lats = pd.concat([points_f['latitude'],  clusters_f['centroid_lat']], ignore_index=True)
     view = compute_view_safe(lons, lats)
 
-    # -------- pontos (amostra)
     if show_points and not points_f.empty:
-        pts = points_f
-        if len(pts) > max_points:
-            pts = pts.sample(max_points, random_state=42)
-
+        pts = points_f if len(points_f) <= max_points else points_f.sample(max_points, random_state=42)
         if color_points_by_region:
-            pts = pts.copy()
-            pts['rgb'] = pts['region_macro'].apply(color_by_region)
-            layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=pts,
-                    get_position='[longitude, latitude]',
-                    get_radius=120,  # maior pra aparecer melhor no zoom inicial
-                    radius_units="meters",
-                    pickable=True,
-                    get_fill_color='rgb',
-                )
-            )
+            pts = pts.copy(); pts['rgb'] = pts['region_macro'].apply(color_by_region)
+            layers.append(pdk.Layer("ScatterplotLayer", data=pts,
+                                    get_position='[longitude, latitude]',
+                                    get_radius=120, radius_units="meters",
+                                    pickable=True, get_fill_color='rgb'))
         else:
-            layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=pts,
-                    get_position='[longitude, latitude]',
-                    get_radius=120,
-                    radius_units="meters",
-                    pickable=True,
-                    get_fill_color=[30, 144, 255, 120],
-                )
-            )
+            layers.append(pdk.Layer("ScatterplotLayer", data=pts,
+                                    get_position='[longitude, latitude]',
+                                    get_radius=120, radius_units="meters",
+                                    pickable=True, get_fill_color=[30,144,255,120]))
 
-    # -------- áreas (raio p90)
     if show_areas:
         areas = clusters_f.assign(radius_m=clusters_f['radius_m'].clip(lower=200)).copy()
         areas['rgb'] = areas['region_macro'].apply(color_by_region)
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=areas,
-                get_position='[centroid_lon, centroid_lat]',
-                get_radius="radius_m",
-                radius_units="meters",
-                pickable=True,
-                get_fill_color='rgb',
-                get_line_color=[50, 50, 50, 200],
-                line_width_min_pixels=1,
-            )
-        )
+        layers.append(pdk.Layer("ScatterplotLayer", data=areas,
+                                get_position='[centroid_lon, centroid_lat]',
+                                get_radius="radius_m", radius_units="meters",
+                                pickable=True, get_fill_color='rgb',
+                                get_line_color=[50,50,50,200], line_width_min_pixels=1))
 
-    # -------- centróides
     if show_centroids:
-        centers = clusters_f.copy()
-        centers['rgb'] = centers['region_macro'].apply(color_by_region)
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=centers,
-                get_position='[centroid_lon, centroid_lat]',
-                get_radius=90,
-                radius_units="meters",
-                get_fill_color='rgb',
-                pickable=True,
-            )
-        )
+        centers = clusters_f.copy(); centers['rgb'] = centers['region_macro'].apply(color_by_region)
+        layers.append(pdk.Layer("ScatterplotLayer", data=centers,
+                                get_position='[centroid_lon, centroid_lat]',
+                                get_radius=90, radius_units="meters",
+                                get_fill_color='rgb', pickable=True))
 
     tooltip_cfg = {
         "html": (
