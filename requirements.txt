@@ -2,4 +2,4 @@ streamlit==1.38.0
 pandas==2.2.3
 numpy==2.2.2
 pydeck==0.9.1
-pyarrow==17.0.0
+fastparquet==2024.5.0
