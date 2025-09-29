@@ -3,3 +3,6 @@ pandas==2.2.3
 numpy==2.2.2
 pydeck==0.9.1
 fastparquet==2024.5.0
+geopandas==1.0.1
+shapely==2.0.4
+pyproj==3.6.1
