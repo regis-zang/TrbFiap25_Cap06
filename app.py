@@ -1,9 +1,19 @@
 # app.py
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
-from pathlib import Path
+
+# ---- (opcional) diagnose de versões
+st.caption(f"Python: {sys.version.split()[0]}")
+try:
+    import numpy as _np, pandas as _pd, fastparquet as _fp  # noqa: F401
+    st.caption(f"NumPy: {_np.__version__} | Pandas: {_pd.__version__} | Parquet: fastparquet ✅")
+except Exception:
+    st.caption("Parquet engine: (não detectado) ⚠️")
 
 # =========================
 # Config
@@ -22,46 +32,60 @@ def load_parquet_safe(path: Path) -> pd.DataFrame:
         existing = [p.name for p in DATA_DIR.glob("*.parquet")]
         raise FileNotFoundError(
             f"Arquivo não encontrado: {path}\n"
-            f"Arquivos disponíveis em {DATA_DIR.resolve()}:\n - " + "\n - ".join(existing)
+            f"Disponíveis em {DATA_DIR.resolve()}:\n - " + "\n - ".join(existing)
         )
-    return pd.read_parquet(path)
+    # tenta engine default (deve pegar fastparquet)
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        # força fastparquet explicitamente
+        return pd.read_parquet(path, engine="fastparquet")
 
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0088
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
     return 2*R*np.arcsin(np.sqrt(a))
 
 def color_by_region(region: str) -> list:
-    # Paleta simples (RGB) por macro-região
     pal = {
-        "Norte":       [ 26, 188, 156, 180],  # teal
-        "Nordeste":    [241, 196,  15, 180],  # amarelo
-        "Centro-Oeste":[142,  68, 173, 180],  # roxo
-        "Sudeste":     [ 52, 152, 219, 180],  # azul
-        "Sul":         [231,  76,  60, 180],  # vermelho
-        "Indefinido":  [127, 140, 141, 180],  # cinza
+        "Norte":        [ 26, 188, 156, 180],
+        "Nordeste":     [241, 196,  15, 180],
+        "Centro-Oeste": [142,  68, 173, 180],
+        "Sudeste":      [ 52, 152, 219, 180],
+        "Sul":          [231,  76,  60, 180],
+        "Indefinido":   [127, 140, 141, 180],
     }
     return pal.get(region, pal["Indefinido"])
 
-def build_deck_resilient(layers, center_lat, center_lon, tooltip_cfg):
-    """Cria o pdk.Deck funcionando com/sem token e em versões diferentes do pydeck."""
-    deck_kwargs = dict(
-        initial_view_state=pdk.ViewState(latitude=float(center_lat),
-                                         longitude=float(center_lon),
-                                         zoom=5),
-        layers=layers,
-    )
+def compute_view_safe(lons, lats):
+    """Tenta usar compute_view do pydeck; se não existir, faz um fallback simples."""
+    try:
+        from pydeck.data_utils import compute_view
+        df = pd.DataFrame({"lon": lons, "lat": lats})
+        view = compute_view(df[["lon", "lat"]])
+        try:
+            view.zoom = min(9, max(3, float(view.zoom) + 0.5))
+        except Exception:
+            view.zoom = 6
+        return view
+    except Exception:
+        return pdk.ViewState(latitude=float(np.mean(lats)),
+                             longitude=float(np.mean(lons)),
+                             zoom=6)
 
-    # tenta incluir tooltip; se versão não suportar, remove
+def build_deck_resilient(layers, view_state, tooltip_cfg):
+    """Cria o pdk.Deck com Mapbox (se houver token), senão Carto, senão sem base map."""
+    deck_kwargs = dict(initial_view_state=view_state, layers=layers)
+    # tenta incluir tooltip; se a versão não suportar, remove
     try:
         deck_kwargs["tooltip"] = tooltip_cfg
     except Exception:
         pass
 
-    # 1) token via secrets (se houver)
+    # token via secrets (se houver)
     mapbox_key = st.secrets.get("MAPBOX_API_KEY", "").strip()
     if mapbox_key:
         try:
@@ -69,7 +93,6 @@ def build_deck_resilient(layers, center_lat, center_lon, tooltip_cfg):
         except Exception:
             pass
 
-    # 2) tenta Mapbox; se falhar, Carto; se falhar, sem base map
     try:
         return pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", **deck_kwargs)
     except TypeError:
@@ -101,7 +124,7 @@ if missing_c:
     st.error(f"Faltam colunas em clusters: {missing_c}")
     st.stop()
 
-# garante radius_km (p90) se não existir
+# radius_km (p90) se não existir
 if 'radius_km' not in clusters.columns:
     tmp = points.merge(
         clusters[['cluster','centroid_lat','centroid_lon']],
@@ -114,7 +137,7 @@ if 'radius_km' not in clusters.columns:
         on='cluster', how='left'
     )
 
-# garante region_macro e cd_name
+# region_macro & cd_name
 if 'region_macro' not in clusters.columns:
     clusters['region_macro'] = 'Indefinido'
 if 'cd_name' not in clusters.columns:
@@ -122,11 +145,9 @@ if 'cd_name' not in clusters.columns:
 
 clusters['radius_m'] = (clusters['radius_km'].fillna(0)*1000).astype(float)
 
-# leva nomes/cores para points (para tooltips/cores por região)
-points = points.merge(
-    clusters[['cluster','cd_name','region_macro']],
-    on='cluster', how='left'
-)
+# metadata para points
+points = points.merge(clusters[['cluster','cd_name','region_macro']],
+                      on='cluster', how='left')
 
 # =========================
 # Sidebar / filtros
@@ -140,7 +161,7 @@ region_opts = sorted(clusters['region_macro'].dropna().unique().tolist())
 sel_regions = st.sidebar.multiselect("Macro-região", region_opts, default=region_opts)
 
 max_points = int(st.sidebar.number_input("Máx. de pontos no mapa (amostra)",
-                                         min_value=500, max_value=50000, value=8000, step=500))
+                                         min_value=500, max_value=50000, value=7000, step=500))
 show_points    = st.sidebar.checkbox("Mostrar pontos", value=True)
 show_areas     = st.sidebar.checkbox("Mostrar áreas (raio p90)", value=True)
 show_centroids = st.sidebar.checkbox("Mostrar centróides", value=True)
@@ -151,7 +172,6 @@ color_points_by_region = st.sidebar.checkbox("Colorir pontos por macro-região",
 # =========================
 points_f = points[points['cluster'].astype(int).isin(sel_clusters)].copy()
 clusters_f = clusters[clusters['cluster'].astype(int).isin(sel_clusters)].copy()
-
 if sel_regions:
     clusters_f = clusters_f[clusters_f['region_macro'].isin(sel_regions)]
     points_f = points_f[points_f['cluster'].isin(clusters_f['cluster'])]
@@ -168,15 +188,28 @@ c4.metric("Maior raio p90 (km)", f"{clusters_f['radius_km'].max():.2f}")
 # =========================
 # Mapa
 # =========================
-if clusters_f.empty:
-    st.warning("Nenhum cluster selecionado.")
-else:
-    center_lat = float(clusters_f['centroid_lat'].mean())
-    center_lon = float(clusters_f['centroid_lon'].mean())
+st.subheader("Mapa de Clusters e Áreas de Cobertura (p90)")
 
-    layers = []
+layers = []
+if not clusters_f.empty:
+    # -------- view automático
+    lons = pd.concat(
+        [
+            points_f['longitude'],
+            clusters_f['centroid_lon']
+        ],
+        ignore_index=True
+    )
+    lats = pd.concat(
+        [
+            points_f['latitude'],
+            clusters_f['centroid_lat']
+        ],
+        ignore_index=True
+    )
+    view = compute_view_safe(lons, lats)
 
-    # pontos (amostra pra performance)
+    # -------- pontos (amostra)
     if show_points and not points_f.empty:
         pts = points_f
         if len(pts) > max_points:
@@ -185,31 +218,33 @@ else:
         if color_points_by_region:
             pts = pts.copy()
             pts['rgb'] = pts['region_macro'].apply(color_by_region)
-            points_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=pts,
-                get_position='[longitude, latitude]',
-                get_radius=50,
-                radius_units="meters",
-                pickable=True,
-                get_fill_color='rgb',   # coluna com lista [r,g,b,a]
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=pts,
+                    get_position='[longitude, latitude]',
+                    get_radius=120,  # maior pra aparecer melhor no zoom inicial
+                    radius_units="meters",
+                    pickable=True,
+                    get_fill_color='rgb',
+                )
             )
         else:
-            points_layer = pdk.Layer(
-                "ScatterplotLayer",
-                data=pts,
-                get_position='[longitude, latitude]',
-                get_radius=50,
-                radius_units="meters",
-                pickable=True,
-                get_fill_color=[30, 144, 255, 120],  # azul translúcido
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=pts,
+                    get_position='[longitude, latitude]',
+                    get_radius=120,
+                    radius_units="meters",
+                    pickable=True,
+                    get_fill_color=[30, 144, 255, 120],
+                )
             )
-        layers.append(points_layer)
 
-    # áreas (raio p90)
-    if show_areas and not clusters_f.empty:
-        areas = clusters_f.assign(radius_m=clusters_f['radius_m'].clip(lower=200))
-        areas = areas.copy()
+    # -------- áreas (raio p90)
+    if show_areas:
+        areas = clusters_f.assign(radius_m=clusters_f['radius_m'].clip(lower=200)).copy()
         areas['rgb'] = areas['region_macro'].apply(color_by_region)
         layers.append(
             pdk.Layer(
@@ -220,13 +255,13 @@ else:
                 radius_units="meters",
                 pickable=True,
                 get_fill_color='rgb',
-                get_line_color=[50, 50, 50, 160],
+                get_line_color=[50, 50, 50, 200],
                 line_width_min_pixels=1,
             )
         )
 
-    # centróides
-    if show_centroids and not clusters_f.empty:
+    # -------- centróides
+    if show_centroids:
         centers = clusters_f.copy()
         centers['rgb'] = centers['region_macro'].apply(color_by_region)
         layers.append(
@@ -234,7 +269,7 @@ else:
                 "ScatterplotLayer",
                 data=centers,
                 get_position='[centroid_lon, centroid_lat]',
-                get_radius=70,
+                get_radius=90,
                 radius_units="meters",
                 get_fill_color='rgb',
                 pickable=True,
@@ -252,17 +287,15 @@ else:
         "style": {"backgroundColor": "rgba(0,0,0,0.85)", "color": "white"},
     }
 
-    deck = build_deck_resilient(layers, center_lat, center_lon, tooltip_cfg)
-
-    # indicador do provider (Mapbox/Carto)
+    deck = build_deck_resilient(layers, view, tooltip_cfg)
     st.caption("Base map: " + ("Mapbox ✅" if bool(st.secrets.get('MAPBOX_API_KEY', '').strip())
                                else "Carto/No base ✅"))
-
-    st.subheader("Mapa de Clusters e Áreas de Cobertura (p90)")
     st.pydeck_chart(deck, use_container_width=True)
+else:
+    st.warning("Nenhum cluster selecionado para exibir no mapa.")
 
 # =========================
-# Tabelas
+# Tabela + download
 # =========================
 st.markdown("### Clusters selecionados")
 st.dataframe(
@@ -270,7 +303,6 @@ st.dataframe(
     use_container_width=True
 )
 
-# Download do resumo filtrado
 csv = clusters_f.to_csv(index=False).encode("utf-8")
-st.download_button("Baixar resumo de clusters (CSV)", data=csv,
-                   file_name="clusters_summary_filtrado.csv", mime="text/csv")
+st.download_button("Baixar resumo de clusters (CSV)",
+                   data=csv, file_name="clusters_summary_filtrado.csv", mime="text/csv")
